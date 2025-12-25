@@ -1,0 +1,752 @@
+// ===== CONFIGURATION =====
+const CONFIG = {
+  // Two parallel pipelines (List + Tracker)
+  pipelines: {
+    prospective: {
+      listSheet: 'Prospective Customer List',
+      trackerSheet: 'Prospective Customer Tracker',
+    },
+    current: {
+      listSheet: 'Current Customer List',
+      trackerSheet: 'Current Customer Tracker',
+    },
+  },
+
+  identificationMethod: 'LIST',
+
+  hoursToCheck: 1,
+  recalculateAllEmails: false,
+  maxThreadsToSearch: 500,
+
+  // Follow-up settings (shared across both pipelines)
+  daysUntilFollowup: 2,
+  followupLabel: 'Needs Follow-up',
+  starFollowupEmails: true,
+
+  // Gmail label -> auto-add to List sheets
+  gmailLabelSync: {
+    enabled: true,
+
+    // EXACT Gmail label names (case-sensitive)
+    labelProspective: 'prospective customer',
+    labelCurrent: 'current customer',
+
+    // Exclude internal emails (your team)
+    excludeDomains: ['chemtbio.com'],
+
+    // Optional: exclude common system emails too
+    excludePatterns: [/no-?reply/i, /do-?not-?reply/i],
+
+    // Scan limits per run
+    maxThreadsPerLabel: 200,
+
+    // If true, removes the label after successfully adding emails (prevents re-processing)
+    removeLabelAfterSync: false,
+  },
+
+};
+
+// ===== MAIN ENTRYPOINT (TRACK BOTH PIPELINES) =====
+function trackAllCustomerEmails() {
+  trackCustomerEmailsForPipeline(CONFIG.pipelines.prospective);
+  trackCustomerEmailsForPipeline(CONFIG.pipelines.current);
+}
+
+// ===== TRACK ONE PIPELINE =====
+function trackCustomerEmailsForPipeline(pipeline) {
+  const sheet = getOrCreateSheet(pipeline.trackerSheet);
+
+  // Initialize headers if empty
+  if (sheet.getLastRow() === 0) {
+    const headers = [
+      'Email Address',
+      'Customer Name',
+      'Company',
+      'First Contact',
+      'Last Contact',
+      'Total Emails',
+      'Last Email Date',
+      'Conversation Summary',
+      'Status',
+    ];
+    sheet.appendRow(headers);
+    sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold');
+    sheet.setFrozenRows(1);
+  }
+
+  const customerEmails = getCustomerEmailsFromListSheet(pipeline.listSheet);
+
+  if (customerEmails.size === 0) {
+    Logger.log(`No customers identified in list: ${pipeline.listSheet}`);
+    return;
+  }
+
+  Logger.log(`(${pipeline.trackerSheet}) Found ${customerEmails.size} customer(s)`);
+
+  const existingCustomers = getExistingCustomers(sheet);
+  const recentEmails = findRecentCustomerEmails(customerEmails, existingCustomers);
+
+  // Process each customer and collect rows to sort
+  const updatedCustomers = [];
+
+  recentEmails.forEach((emailData, customerEmail) => {
+    const existingRow = existingCustomers.get(customerEmail);
+
+    if (existingRow) {
+      updateCustomerRow(sheet, existingRow, emailData);
+      updatedCustomers.push(customerEmail);
+    } else {
+      addNewCustomer(sheet, customerEmail, emailData);
+      updatedCustomers.push(customerEmail);
+    }
+  });
+
+  // Move updated customers to top
+  if (updatedCustomers.length > 0) {
+    moveCustomersToTop(sheet, updatedCustomers);
+  }
+  Logger.log(`(${pipeline.trackerSheet}) Processed ${recentEmails.size} customer(s)`);
+}
+
+// Backwards-compatible wrapper (if you still call the old function name somewhere)
+function trackCustomerEmails() {
+  trackAllCustomerEmails();
+}
+
+// ===== CUSTOMER IDENTIFICATION (PER LIST SHEET) =====
+function getCustomerEmailsFromListSheet(listSheetName) {
+  const customers = new Set();
+
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const listSheet = ss.getSheetByName(listSheetName);
+    if (listSheet && listSheet.getLastRow() > 0) {
+      // Assumes emails are in column A (starting row 1)
+      const emails = listSheet.getRange(1, 1, listSheet.getLastRow(), 1).getValues();
+      emails.forEach((row) => {
+        if (row[0]) customers.add(row[0].toString().toLowerCase().trim());
+      });
+    }
+  } catch (e) {
+    Logger.log(`Customer list error (${listSheetName}): ` + e.toString());
+  }
+
+  return customers;
+}
+
+// Used by follow-up system: union of both lists
+function getAllCustomerEmails() {
+  const all = new Set();
+  const p = getCustomerEmailsFromListSheet(CONFIG.pipelines.prospective.listSheet);
+  const c = getCustomerEmailsFromListSheet(CONFIG.pipelines.current.listSheet);
+
+  p.forEach((e) => all.add(e));
+  c.forEach((e) => all.add(e));
+
+  return all;
+}
+
+// ===== EMAIL PROCESSING =====
+function findRecentCustomerEmails(customerEmails, existingCustomers) {
+  const customerData = new Map();
+  const cutoffDate = new Date(Date.now() - CONFIG.hoursToCheck * 60 * 60 * 1000);
+
+  Logger.log(`Checking emails since: ${cutoffDate}`);
+
+  let threads = [];
+
+  if (CONFIG.recalculateAllEmails) {
+    customerEmails.forEach((customerEmail) => {
+      const query = `from:${customerEmail} OR to:${customerEmail}`;
+      const customerThreads = GmailApp.search(query, 0, 100);
+      threads = threads.concat(customerThreads);
+    });
+  } else {
+    customerEmails.forEach((customerEmail) => {
+      const existing = existingCustomers.get(customerEmail);
+      let searchDate = cutoffDate;
+
+      if (existing && existing.lastEmailDate) {
+        searchDate = new Date(existing.lastEmailDate);
+        searchDate = new Date(searchDate.getTime() + 1000);
+      }
+
+      const dateStr = Utilities.formatDate(searchDate, Session.getScriptTimeZone(), 'yyyy/MM/dd');
+      const query = `(from:${customerEmail} OR to:${customerEmail}) after:${dateStr}`;
+      const customerThreads = GmailApp.search(query, 0, 50);
+      threads = threads.concat(customerThreads);
+    });
+  }
+
+  const uniqueThreads = [...new Map(threads.map((t) => [t.getId(), t])).values()];
+  Logger.log(`Processing ${uniqueThreads.length} threads`);
+
+  // Track processed message IDs to avoid duplicates
+  const processedMessages = new Map();
+
+  uniqueThreads.forEach((thread) => {
+    const messages = thread.getMessages();
+
+    messages.forEach((message) => {
+      const messageId = message.getId();
+      const messageDate = message.getDate();
+
+      // Skip if already processed
+      if (processedMessages.has(messageId)) {
+        return;
+      }
+
+      const fromEmail = extractEmail(message.getFrom()).toLowerCase();
+      const toEmails = message.getTo().split(',').map((e) => extractEmail(e).toLowerCase());
+      const ccRaw = message.getCc() || '';
+      const ccEmails = ccRaw
+        ? ccRaw.split(',').map((e) => extractEmail(e).toLowerCase())
+        : [];
+
+      const allEmails = [fromEmail, ...toEmails, ...ccEmails];
+      const customerEmail = allEmails.find((email) => customerEmails.has(email));
+
+      if (customerEmail) {
+        const existing = existingCustomers.get(customerEmail);
+
+        if (!CONFIG.recalculateAllEmails && existing && existing.lastEmailDate) {
+          if (messageDate <= existing.lastEmailDate) {
+            return;
+          }
+        }
+
+        // Mark as processed
+        processedMessages.set(messageId, true);
+
+        if (!customerData.has(customerEmail)) {
+          let customerName = '';
+
+          const threadMessages = thread.getMessages();
+          for (let threadMsg of threadMessages) {
+            const threadFromEmail = extractEmail(threadMsg.getFrom()).toLowerCase();
+            if (threadFromEmail === customerEmail) {
+              customerName = extractName(threadMsg.getFrom());
+              break;
+            }
+          }
+
+          if (!customerName) {
+            const toFull = message.getTo() || '';
+            const ccFull = message.getCc() || '';
+            const allRecipients = toFull + ',' + ccFull;
+
+            const recipientParts = allRecipients.split(',');
+            for (let recipient of recipientParts) {
+              recipient = (recipient || '').trim();
+              if (recipient && extractEmail(recipient).toLowerCase() === customerEmail) {
+                const extractedName = extractName(recipient);
+                if (extractedName !== extractNameFromEmail(customerEmail)) {
+                  customerName = extractedName;
+                }
+                break;
+              }
+            }
+          }
+
+          if (!customerName) {
+            customerName = extractNameFromEmail(customerEmail);
+          }
+
+          customerData.set(customerEmail, {
+            name: customerName,
+            company: extractCompany(customerEmail),
+            firstContact: messageDate,
+            lastContact: messageDate,
+            lastEmailDate: messageDate,
+            emailCount: 0,
+            messages: [],
+          });
+        }
+
+        const data = customerData.get(customerEmail);
+        data.emailCount++;
+
+        if (messageDate < data.firstContact) data.firstContact = messageDate;
+        if (messageDate > data.lastContact) data.lastContact = messageDate;
+        if (messageDate > data.lastEmailDate) data.lastEmailDate = messageDate;
+
+        data.messages.push({
+          date: messageDate,
+          from: message.getFrom(),
+          subject: message.getSubject(),
+          body: (message.getPlainBody() || '').substring(0, 1000),
+        });
+      }
+    });
+  });
+
+  Logger.log(`Found ${processedMessages.size} unique messages`);
+  return customerData;
+}
+
+// ===== SHEET OPERATIONS =====
+function getExistingCustomers(sheet) {
+  const customers = new Map();
+  const lastRow = sheet.getLastRow();
+
+  if (lastRow > 1) {
+    const data = sheet.getRange(2, 1, lastRow - 1, 9).getValues();
+    data.forEach((row, index) => {
+      if (row[0]) {
+        customers.set(row[0].toLowerCase(), {
+          row: index + 2,
+          email: row[0],
+          name: row[1],
+          company: row[2],
+          firstContact: row[3],
+          lastContact: row[4],
+          totalEmails: row[5] || 0,
+          lastEmailDate: row[6],
+          summary: row[7],
+          status: row[8],
+        });
+      }
+    });
+  }
+
+  return customers;
+}
+
+function updateCustomerRow(sheet, existingRow, newData) {
+  const row = existingRow.row;
+
+  if (!existingRow.firstContact || newData.firstContact < existingRow.firstContact) {
+    sheet.getRange(row, 4).setValue(newData.firstContact);
+  }
+
+  sheet.getRange(row, 5).setValue(newData.lastContact);
+
+  if (CONFIG.recalculateAllEmails) {
+    sheet.getRange(row, 6).setValue(newData.emailCount);
+  } else {
+    const newCount = existingRow.totalEmails + newData.emailCount;
+    sheet.getRange(row, 6).setValue(newCount);
+  }
+
+  sheet.getRange(row, 7).setValue(newData.lastEmailDate);
+
+  if (newData.messages.length > 0) {
+    const summary =
+      CONFIG.enableAISummaries && CONFIG.anthropicApiKey
+        ? generateAISummary(newData.messages)
+        : generateSimpleSummary(newData.messages);
+    sheet.getRange(row, 8).setValue(summary);
+    sheet.getRange(row, 8).setWrap(true);
+  }
+
+  sheet.getRange(row, 9).setValue('Active');
+
+  Logger.log(`Updated: ${existingRow.email} - Added ${newData.emailCount} email(s)`);
+}
+
+function addNewCustomer(sheet, email, data) {
+  const summary =
+    CONFIG.enableAISummaries && CONFIG.anthropicApiKey && data.messages.length > 0
+      ? generateAISummary(data.messages)
+      : generateSimpleSummary(data.messages);
+
+
+  const row = [
+    email,
+    data.name,
+    data.company,
+    data.firstContact,
+    data.lastContact,
+    data.emailCount,
+    data.lastEmailDate,
+    summary,
+    'New',
+  ];
+
+  sheet.insertRowAfter(1);
+  sheet.getRange(2, 1, 1, 9).setValues([row]);
+  sheet.getRange(2, 8).setWrap(true);
+
+  Logger.log(`Added: ${email} with ${data.emailCount} email(s)`);
+}
+
+function moveCustomersToTop(sheet, updatedCustomerEmails) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return;
+
+  const allData = sheet.getRange(2, 1, lastRow - 1, 9).getValues();
+  const updatedSet = new Set(updatedCustomerEmails.map((e) => e.toLowerCase()));
+
+  const updatedRows = [];
+  const otherRows = [];
+
+  allData.forEach((row) => {
+    if (row[0] && updatedSet.has(row[0].toLowerCase())) {
+      updatedRows.push(row);
+    } else if (row[0]) {
+      otherRows.push(row);
+    }
+  });
+
+  // Sort updated rows by last contact (most recent first)
+  updatedRows.sort((a, b) => new Date(b[4]) - new Date(a[4]));
+
+  const reorderedData = [...updatedRows, ...otherRows];
+
+  if (reorderedData.length > 0) {
+    sheet.getRange(2, 1, reorderedData.length, 9).setValues(reorderedData);
+  }
+
+  Logger.log(`Moved ${updatedRows.length} customer(s) to top`);
+}
+
+// ===== FOLLOW-UP REMINDER SYSTEM (SHARED; DOES NOT SPLIT BY PIPELINE) =====
+function checkFollowupReminders() {
+  const customerEmails = getAllCustomerEmails(); // union of Prospective + Current
+  if (customerEmails.size === 0) return;
+
+  const myEmail = Session.getActiveUser().getEmail().toLowerCase();
+  const label = getOrCreateLabel(CONFIG.followupLabel);
+  const cutoffDate = new Date(Date.now() - CONFIG.daysUntilFollowup * 24 * 60 * 60 * 1000);
+
+  let remindersCreated = 0;
+
+  // Check emails where you're waiting for customer reply
+  customerEmails.forEach((customerEmail) => {
+    const threads = GmailApp.search(`to:${customerEmail} from:me`, 0, 50);
+
+    threads.forEach((thread) => {
+      const messages = thread.getMessages();
+      if (messages.length === 0) return;
+
+      let lastMessageFromMe = null;
+      let lastMessageDate = null;
+      let customerRepliedAfter = false;
+
+      // Find last message from you
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i];
+        const fromEmail = extractEmail(msg.getFrom()).toLowerCase();
+
+        if (fromEmail === myEmail) {
+          if (!lastMessageFromMe) {
+            lastMessageFromMe = msg;
+            lastMessageDate = msg.getDate();
+          }
+        } else if (fromEmail === customerEmail && lastMessageDate) {
+          if (msg.getDate() > lastMessageDate) {
+            customerRepliedAfter = true;
+            break;
+          }
+        }
+      }
+
+      if (lastMessageFromMe && !customerRepliedAfter && lastMessageDate < cutoffDate) {
+        if (!thread.getLabels().some((l) => l.getName() === CONFIG.followupLabel)) {
+          thread.moveToInbox();
+          thread.markUnread();
+          label.addToThread(thread);
+
+          if (CONFIG.starFollowupEmails) {
+            const lastMessage = messages[messages.length - 1];
+            lastMessage.star();
+          }
+
+          remindersCreated++;
+          Logger.log(`Follow-up needed: ${lastMessageFromMe.getSubject()}`);
+        }
+      }
+    });
+  });
+
+  // Check emails where customer sent but you haven't replied
+  customerEmails.forEach((customerEmail) => {
+    const threads = GmailApp.search(`from:${customerEmail}`, 0, 50);
+
+    threads.forEach((thread) => {
+      const messages = thread.getMessages();
+      if (messages.length === 0) return;
+
+      const lastMessage = messages[messages.length - 1];
+      const lastFromEmail = extractEmail(lastMessage.getFrom()).toLowerCase();
+      const lastMessageDate = lastMessage.getDate();
+
+      // If last message is from customer and old enough
+      if (lastFromEmail === customerEmail && lastMessageDate < cutoffDate) {
+        if (!thread.getLabels().some((l) => l.getName() === CONFIG.followupLabel)) {
+          thread.moveToInbox();
+          thread.markUnread();
+          label.addToThread(thread);
+
+          if (CONFIG.starFollowupEmails) {
+            lastMessage.star();
+          }
+
+          remindersCreated++;
+          Logger.log(`Response needed: ${lastMessage.getSubject()}`);
+        }
+      }
+    });
+  });
+
+  Logger.log(`Created ${remindersCreated} follow-up reminder(s)`);
+}
+
+// ===== HELPER FUNCTIONS =====
+function extractEmail(fromField) {
+  const match = (fromField || '').match(/<(.+?)>/);
+  return match ? match[1].trim() : (fromField || '').trim();
+}
+
+function extractName(fromField) {
+  const match = (fromField || '').match(/^(.+?)\s*</);
+  if (match) {
+    return match[1].replace(/"/g, '').trim();
+  }
+  if ((fromField || '').indexOf('@') === -1) {
+    return (fromField || '').replace(/"/g, '').trim();
+  }
+  return extractNameFromEmail(fromField);
+}
+
+function extractNameFromEmail(email) {
+  const cleanEmail = extractEmail(email);
+  const namePart = cleanEmail.split('@')[0] || '';
+  return namePart.replace(/[._]/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function extractCompany(email) {
+  const domain = (email || '').split('@')[1];
+  if (!domain) return '';
+  const company = domain.split('.')[0] || '';
+  return company ? company.charAt(0).toUpperCase() + company.slice(1) : '';
+}
+
+function generateSimpleSummary(messages) {
+  if (!messages || messages.length === 0) return 'No recent activity';
+
+  // Sort newest first
+  const sorted = messages.sort((a, b) => b.date - a.date);
+
+  // Only look at the most recent message
+  const msg = sorted[0];
+  if (!msg) return 'Recent activity';
+
+  const sender = extractName(msg.from);
+  const dateStr = Utilities.formatDate(
+    msg.date,
+    Session.getScriptTimeZone(),
+    'MMM dd'
+  );
+
+  // Prefer subject over body
+  let topic = (msg.subject || '').trim();
+
+  if (!topic) {
+    let body = (msg.body || '')
+      .replace(/On .+ wrote:/g, '')
+      .replace(/\n+/g, ' ')
+      .trim();
+
+    topic = body.substring(0, 80);
+  }
+
+  if (topic.length > 80) topic = topic.substring(0, 80) + '…';
+
+  return `[${dateStr}] ${sender}: ${topic}`;
+}
+
+function getOrCreateSheet(sheetName) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(sheetName);
+  if (!sheet) sheet = ss.insertSheet(sheetName);
+  return sheet;
+}
+
+function getOrCreateLabel(labelName) {
+  let label = GmailApp.getUserLabelByName(labelName);
+  if (!label) label = GmailApp.createLabel(labelName);
+  return label;
+}
+
+function syncGmailLabeledThreadsToCustomerLists() {
+  const cfg = CONFIG.gmailLabelSync;
+  if (!cfg || !cfg.enabled) return;
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const sheetProspective = getOrCreateSheet(CONFIG.pipelines.prospective.listSheet);
+  const sheetCurrent = getOrCreateSheet(CONFIG.pipelines.current.listSheet);
+
+  const existingProspective = readEmailColumnSet_(sheetProspective, 1);
+  const existingCurrent = readEmailColumnSet_(sheetCurrent, 1);
+
+  const labelProspective = GmailApp.getUserLabelByName(cfg.labelProspective);
+  const labelCurrent = GmailApp.getUserLabelByName(cfg.labelCurrent);
+
+  if (!labelProspective && !labelCurrent) {
+    Logger.log(`No labels found: "${cfg.labelProspective}" or "${cfg.labelCurrent}"`);
+    return;
+  }
+
+  const excludeDomains = (cfg.excludeDomains || []).map(d => d.toLowerCase());
+  const excludePatterns = cfg.excludePatterns || [];
+  const maxThreads = cfg.maxThreadsPerLabel || 200;
+
+  let addedProspective = 0;
+  let addedCurrent = 0;
+
+  if (labelProspective) {
+    const res = processLabelToListSheet_({
+      label: labelProspective,
+      targetSheet: sheetProspective,
+      existingSet: existingProspective,
+      excludeDomains,
+      excludePatterns,
+      maxThreads,
+      removeLabelAfterSync: !!cfg.removeLabelAfterSync,
+    });
+    addedProspective = res.added;
+  }
+
+  if (labelCurrent) {
+    const res = processLabelToListSheet_({
+      label: labelCurrent,
+      targetSheet: sheetCurrent,
+      existingSet: existingCurrent,
+      excludeDomains,
+      excludePatterns,
+      maxThreads,
+      removeLabelAfterSync: !!cfg.removeLabelAfterSync,
+    });
+    addedCurrent = res.added;
+  }
+
+  Logger.log(
+    `syncGmailLabeledThreadsToCustomerLists done. Added prospective=${addedProspective}, current=${addedCurrent}`
+  );
+}
+
+function readEmailColumnSet_(sheet, col1Based) {
+  const set = new Set();
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 1) return set;
+
+  const values = sheet.getRange(1, col1Based, lastRow, 1).getValues();
+  values.forEach(r => {
+    const v = (r[0] || '').toString().trim().toLowerCase();
+    if (v && v.includes('@')) set.add(v);
+  });
+  return set;
+}
+
+function appendEmailsToList_(sheet, emails) {
+  if (!emails || emails.length === 0) return 0;
+  const startRow = sheet.getLastRow() + 1;
+  const rows = emails.map(e => [e]);
+  sheet.getRange(startRow, 1, rows.length, 1).setValues(rows);
+  return rows.length;
+}
+
+function processLabelToListSheet_(opts) {
+  const {
+    label,
+    targetSheet,
+    existingSet,
+    excludeDomains,
+    excludePatterns,
+    maxThreads,
+    removeLabelAfterSync,
+  } = opts;
+
+  const threads = label.getThreads(0, maxThreads);
+  const toAdd = new Set();
+
+  threads.forEach(thread => {
+    const participants = extractThreadParticipantEmails_(thread);
+
+    const externalEmails = participants
+      .map(e => e.toLowerCase().trim())
+      .filter(e => isValidExternalEmail_(e, excludeDomains, excludePatterns));
+
+    externalEmails.forEach(e => {
+      if (!existingSet.has(e)) {
+        toAdd.add(e);
+        existingSet.add(e); // dedupe within this run
+      }
+    });
+
+    if (removeLabelAfterSync && toAdd.size > 0) {
+      label.removeFromThread(thread);
+    }
+  });
+
+  const added = appendEmailsToList_(targetSheet, [...toAdd].sort());
+  Logger.log(
+    `Label "${label.getName()}": scanned ${threads.length} threads, added ${added} email(s) to "${targetSheet.getName()}"`
+  );
+
+  return { added };
+}
+
+function extractThreadParticipantEmails_(thread) {
+  const out = new Set();
+  const messages = thread.getMessages();
+
+  messages.forEach(m => {
+    const from = extractEmail(m.getFrom());
+    if (from) out.add(from);
+
+    const to = (m.getTo() || '')
+      .split(',')
+      .map(x => extractEmail(x))
+      .filter(Boolean);
+    to.forEach(e => out.add(e));
+
+    const cc = (m.getCc() || '')
+      .split(',')
+      .map(x => extractEmail(x))
+      .filter(Boolean);
+    cc.forEach(e => out.add(e));
+  });
+
+  return [...out];
+}
+
+function isValidExternalEmail_(email, excludeDomains, excludePatterns) {
+  if (!email || !email.includes('@')) return false;
+
+  // basic sanity
+  const e = email.toLowerCase();
+
+  // exclude internal domains
+  const domain = e.split('@')[1] || '';
+  if (excludeDomains && excludeDomains.includes(domain)) return false;
+
+  // exclude no-reply etc.
+  if (excludePatterns && excludePatterns.some(rx => rx.test(e))) return false;
+
+  return true;
+}
+
+// ===== SETUP FUNCTIONS =====
+function doFullRecalculation() {
+  Logger.log('Starting full recalculation...');
+  const originalSetting = CONFIG.recalculateAllEmails;
+  CONFIG.recalculateAllEmails = true;
+  trackAllCustomerEmails();
+  CONFIG.recalculateAllEmails = originalSetting;
+  Logger.log('Full recalculation complete!');
+}
+
+function manualCheckNow() {
+  if (CONFIG.gmailLabelSync && CONFIG.gmailLabelSync.enabled) {
+    Logger.log('Syncing Gmail-labeled threads to customer lists...');
+    syncGmailLabeledThreadsToCustomerLists();
+  }
+  Logger.log('=== Tracking emails (Prospective + Current) ===');
+  trackAllCustomerEmails();
+  Logger.log('\n=== Checking follow-ups (combined) ===');
+  checkFollowupReminders();
+  Logger.log('\nDone!');
+}
